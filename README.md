@@ -342,7 +342,7 @@ Once the API service is running, you can access the API documentation at http://
 
 > [!IMPORTANT]
 >
-> If your GPU is from the 20/30/40-series, V100, or similar, please build the patched Docker image for LMDeploy compatibility:
+> If your GPU is from the 20/30/40-series, V100, L20/L40 or similar, please build the patched Docker image for LMDeploy compatibility:
 >
 > ```bash
 > docker compose build monkeyocr-fix
