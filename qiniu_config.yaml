@@ -1,0 +1,29 @@
+# 七牛云存储配置
+qiniu:
+  # 七牛云AccessKey和SecretKey，https://portal.qiniu.com/developer/user/key
+  access_key: your_access_key
+  secret_key: your_secret_key
+  
+  # 存储空间配置，https://portal.qiniu.com/kodo/bucket
+  bucket_name: your_bucket_name
+  
+  # CDN域名 (用于文件下载)，https://portal.qiniu.com/kodo/bucket点击桶内复制外链域名
+  domain: your_domain
+  
+  # 上传策略配置
+  upload_policy:
+    # 上传凭证有效期 (秒)
+    expires: 3600
+    # 允许的文件类型 (留空则不限制)
+    mime_limit: ""
+    # 最大文件大小 (字节, 0表示不限制)
+    fsizeLimit: 0
+    # 是否开启HTTPS
+    https: false
+  
+  # 下载配置
+  download:
+    # 私有下载链接有效期 (秒)
+    expires: 3600
+    # 是否使用HTTPS
+    https: false
