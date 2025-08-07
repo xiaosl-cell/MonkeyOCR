@@ -684,7 +684,7 @@ async def create_zip_file_async(result_dir, zip_path, original_name, split_pages
                                 if filename_part.startswith('images/'):
                                     # Handle images: page_0/images/img.jpg -> page_0/images/original_name_img.jpg
                                     img_name = filename_part.replace('images/', '')
-                                    new_filename = f"{page_dir}/images/{original_name}_{img_name}"
+                                    new_filename = f"{page_dir}/images/{img_name}"
                                 else:
                                     # Handle other files in page directories
                                     new_filename = f"{page_dir}/{original_name}_{filename_part}"
@@ -711,7 +711,7 @@ async def create_zip_file_async(result_dir, zip_path, original_name, split_pages
                             if 'images/' in rel_path:
                                 # Keep images in images subfolder with original name prefix
                                 image_name = os.path.basename(rel_path)
-                                new_filename = f"images/{original_name}_{image_name}"
+                                new_filename = f"images/{image_name}"
                             else:
                                 new_filename = f"{original_name}_{filename}"
                     
