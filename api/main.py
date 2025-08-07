@@ -12,7 +12,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from tempfile import gettempdir
@@ -21,7 +21,15 @@ from loguru import logger
 import time
 
 from magic_pdf.model.custom_model import MonkeyOCR
+from magic_pdf.data.io.qiniu_client import QiniuOSSClient
 import uvicorn
+
+# Request models
+class OCRRequest(BaseModel):
+    remote_key: str
+
+class ParseRequest(BaseModel):
+    remote_key: str
 
 # Response models
 class TaskResponse(BaseModel):
@@ -42,6 +50,7 @@ monkey_ocr_model = None
 supports_async = False
 model_lock = asyncio.Lock()
 executor = ThreadPoolExecutor(max_workers=4)
+qiniu_client = None
 
 def initialize_model():
     """Initialize MonkeyOCR model"""
@@ -52,6 +61,57 @@ def initialize_model():
         monkey_ocr_model = MonkeyOCR(config_path)
         supports_async = is_async_model(monkey_ocr_model)
     return monkey_ocr_model
+
+def initialize_qiniu_client():
+    """Initialize Qiniu client"""
+    global qiniu_client
+    if qiniu_client is None:
+        try:
+            qiniu_client = QiniuOSSClient()
+            logger.info("✅ 七牛云客户端初始化成功")
+        except Exception as e:
+            logger.error(f"❌ 七牛云客户端初始化失败: {e}")
+            raise
+    return qiniu_client
+
+async def download_file_from_qiniu(remote_key: str) -> str:
+    """
+    从七牛云下载文件到临时目录
+    
+    Args:
+        remote_key: 七牛云文件key
+        
+    Returns:
+        本地临时文件路径
+    """
+    if not qiniu_client:
+        raise HTTPException(status_code=500, detail="七牛云客户端未初始化")
+    
+    # 检查文件是否存在
+    if not qiniu_client.file_exists(remote_key):
+        raise HTTPException(status_code=404, detail=f"文件不存在: {remote_key}")
+    
+    # 获取文件信息
+    file_info = qiniu_client.get_file_info(remote_key)
+    if not file_info['success']:
+        raise HTTPException(status_code=500, detail=f"获取文件信息失败: {file_info.get('error', 'Unknown error')}")
+    
+    # 创建临时文件，使用remote_key作为文件名
+    # 将路径分隔符替换为下划线，避免目录问题
+    safe_filename = remote_key.replace('/', '_').replace('\\', '_')
+    temp_file_path = os.path.join(temp_dir, safe_filename)
+    
+    # 下载文件
+    def download_sync():
+        return qiniu_client.download_file(remote_key, temp_file_path)
+    
+    download_result = await asyncio.get_event_loop().run_in_executor(None, download_sync)
+    
+    if not download_result['success']:
+        raise HTTPException(status_code=500, detail=f"文件下载失败: {download_result.get('error', 'Unknown error')}")
+    
+    logger.info(f"文件下载成功: {remote_key} -> {temp_file_path}")
+    return temp_file_path
 
 def is_async_model(model: MonkeyOCR) -> bool:
     """Check if the model supports async concurrent calls"""
@@ -166,8 +226,10 @@ async def lifespan(app: FastAPI):
         initialize_model()
         model_type = "async-capable" if supports_async else "sync-only"
         logger.info(f"✅ MonkeyOCR model initialized successfully ({model_type})")
+        
+        initialize_qiniu_client()
     except Exception as e:
-        logger.info(f"❌ Failed to initialize MonkeyOCR model: {e}")
+        logger.info(f"❌ Failed to initialize: {e}")
         raise
     
     yield
@@ -200,29 +262,29 @@ async def health_check():
     return {"status": "healthy", "model_loaded": monkey_ocr_model is not None}
 
 @app.post("/ocr/text", response_model=TaskResponse)
-async def extract_text(file: UploadFile = File(...)):
+async def extract_text(request: OCRRequest):
     """Extract text from image or PDF"""
-    return await perform_ocr_task(file, "text")
+    return await perform_ocr_task(request.remote_key, "text")
 
 @app.post("/ocr/formula", response_model=TaskResponse)
-async def extract_formula(file: UploadFile = File(...)):
+async def extract_formula(request: OCRRequest):
     """Extract formulas from image or PDF"""
-    return await perform_ocr_task(file, "formula")
+    return await perform_ocr_task(request.remote_key, "formula")
 
 @app.post("/ocr/table", response_model=TaskResponse)
-async def extract_table(file: UploadFile = File(...)):
+async def extract_table(request: OCRRequest):
     """Extract tables from image or PDF"""
-    return await perform_ocr_task(file, "table")
+    return await perform_ocr_task(request.remote_key, "table")
 
 @app.post("/parse", response_model=ParseResponse)
-async def parse_document(file: UploadFile = File(...)):
+async def parse_document(request: ParseRequest):
     """Parse complete document (PDF or image)"""
-    return await parse_document_internal(file, split_pages=False)
+    return await parse_document_internal(request.remote_key, split_pages=False)
 
 @app.post("/parse/split", response_model=ParseResponse)
-async def parse_document_split(file: UploadFile = File(...)):
+async def parse_document_split(request: ParseRequest):
     """Parse complete document and split result by pages (PDF or image)"""
-    return await parse_document_internal(file, split_pages=True)
+    return await parse_document_internal(request.remote_key, split_pages=True)
 
 async def async_parse_file(input_file_path: str, output_dir: str, split_pages: bool = False):
     """
@@ -527,7 +589,7 @@ async def async_single_task_recognition(input_file_path: str, output_dir: str, t
     
     return local_md_dir
 
-async def parse_document_internal(file: UploadFile, split_pages: bool = False):
+async def parse_document_internal(remote_key: str, split_pages: bool = False):
     """Internal function to parse document with optional page splitting"""
     try:
         if not monkey_ocr_model:
@@ -535,7 +597,7 @@ async def parse_document_internal(file: UploadFile, split_pages: bool = False):
         
         # Validate file type - support both PDF and image files
         allowed_extensions = {'.pdf', '.jpg', '.jpeg', '.png'}
-        file_ext_with_dot = os.path.splitext(file.filename)[1].lower() if file.filename else ''
+        file_ext_with_dot = os.path.splitext(remote_key)[1].lower()
         
         if file_ext_with_dot not in allowed_extensions:
             raise HTTPException(
@@ -544,16 +606,14 @@ async def parse_document_internal(file: UploadFile, split_pages: bool = False):
             )
         
         # Get original filename without extension
-        original_name = '.'.join(file.filename.split('.')[:-1])
+        original_name = '.'.join(os.path.basename(remote_key).split('.')[:-1])
         
-        # Save uploaded file temporarily with unique name to avoid conflicts
+        # Download file from Qiniu cloud
+        temp_file_path = await download_file_from_qiniu(remote_key)
+        
+        # Generate unique suffix for output
         import uuid
         unique_suffix = str(uuid.uuid4())[:8]
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext_with_dot, prefix=f"upload_{unique_suffix}_") as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
         
         try:
             # Create output directory with unique name
@@ -660,32 +720,28 @@ async def create_zip_file_async(result_dir, zip_path, original_name, split_pages
     # Run ZIP creation in thread pool to avoid blocking
     await asyncio.get_event_loop().run_in_executor(None, create_zip_sync)
 
-async def perform_ocr_task(file: UploadFile, task_type: str) -> TaskResponse:
-    """Perform OCR task on uploaded file"""
+async def perform_ocr_task(remote_key: str, task_type: str) -> TaskResponse:
+    """Perform OCR task on file from Qiniu cloud"""
     try:
         if not monkey_ocr_model:
             raise HTTPException(status_code=500, detail="Model not initialized")
         
-        # Validate file type
+        # Validate file type based on remote_key extension
         allowed_extensions = {'.pdf', '.jpg', '.jpeg', '.png'}
-        file_ext = Path(file.filename).suffix.lower()
+        file_ext = Path(remote_key).suffix.lower()
         if file_ext not in allowed_extensions:
             raise HTTPException(
                 status_code=400, 
                 detail=f"Unsupported file type: {file_ext}. Allowed: {', '.join(allowed_extensions)}"
             )
         
-        # Save uploaded file temporarily with unique name
-        import uuid
-        unique_suffix = str(uuid.uuid4())[:8]
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext, prefix=f"ocr_{unique_suffix}_") as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
+        # Download file from Qiniu cloud
+        temp_file_path = await download_file_from_qiniu(remote_key)
         
         try:
             # Create output directory with unique name
+            import uuid
+            unique_suffix = str(uuid.uuid4())[:8]
             output_dir = tempfile.mkdtemp(prefix=f"monkeyocr_{task_type}_{unique_suffix}_")
             
             # Use optimized async single task recognition
